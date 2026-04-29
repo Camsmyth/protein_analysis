@@ -1,0 +1,6 @@
+biopython>=1.84
+pandas>=2.0
+openpyxl>=3.1
+boltz>=2.0
+asitop>=0.0.24
+matplotlib>=3.8

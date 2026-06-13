@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-Ensemble VHH docking pipeline.
+VHH–antigen docking pipeline.
 
 End-to-end pipeline for confident VHH–antigen complex prediction from enriched
-phage display cluster representatives. Runs four stages automatically:
+phage display cluster representatives. Runs three stages automatically:
 
   Stage 1  NanobodyBuilder2 (ImmuneBuilder) — generates 4 model-diverse VHH
-           conformers from independently pre-trained models, plus one refined
-           baseline structure for visualisation.
-  Stage 2  Centroid-proximity CDR3 selection — retains the conformers whose
-           CDR3 geometry is closest to the ensemble medoid (most physically
-           representative), with a deduplication floor to skip near-exact copies.
-  Stage 3  Templated Boltz2 docking — runs a full two-chain (VHH + antigen)
-           complex prediction for each selected conformer.
-  Stage 4  Convergence scoring — epitope overlap + pose RMSD across conformers.
-           convergence_rank = epitope_overlap × mean_binding_score.
+           structures from independently pre-trained models. The rank-0 (best)
+           structure is OpenMM-relaxed and used as the rigid-body template.
+  Stage 2  Rigid-body Boltz2 docking — runs a two-chain (VHH + antigen) complex
+           prediction with the rank-0 VHH as a fixed structural template for
+           chain A and (optionally) the antigen as a template for chain B.
+           recycling_steps=3; --num-models diffusion samples (default: 5).
+  Stage 3  Convergence scoring — epitope overlap + pose RMSD across diffusion
+           samples. convergence_rank = epitope_overlap × mean_binding_score.
 
 Input CSV columns (configurable via flags):
   Cluster              — cluster representative name  (--names)
@@ -29,7 +28,7 @@ Usage:
     python ensemble_pipeline.py enriched_clusters.csv \\
         --antigen antigens/hCD7_alphafold.pdb \\
         --names Cluster --sequences Protein_Sequence_R2 \\
-        --use-template --max-conformers 4 --num-models 3
+        --use-template --num-models 5
 
 Key flags:
     --antigen PATH            Antigen structure file (.pdb or .cif) [required]
@@ -39,21 +38,18 @@ Key flags:
     --names COLUMN            Sample name column (default: Cluster)
     --sequences COLUMN        Sequence column (default: Protein_Sequence_R2)
     --enrichment COLUMN       Log2 enrichment column carried to output (default: Log2_Enrichment)
-    --cdr3-rmsd-threshold Å   Min CDR3 RMSD between any two accepted conformers (dedup floor, default: 1.5)
-    --max-conformers N        Max conformers to dock (default: 4, max possible: 4)
-    --num-models N            Diffusion samples per conformer docking (default: 2)
+    --num-models N            Diffusion samples for rigid-body docking (default: 5)
     --max-parallel-samples N  GPU memory control for docking
     --no-msa-server           Disable ColabFold MSA server
     --output DIR              Output root directory
     --accelerator gpu/cpu/tpu
 
 Outputs (under --output):
-    vhh_structures/{name}/            NanobodyBuilder2 baseline + 4 conformer PDBs
-    vhh_structures/representatives/   Selected conformer PDBs after CDR3 clustering
-    docking/{name}_conformer_{k}/     Per-conformer Boltz2 docking results
-    ensemble_binding_scores.csv       Aggregated convergence scores (one row per VHH)
-    ensemble_per_model.csv            Full per-docking-model detail
-    logs/                             Boltz2 stdout/stderr logs
+    vhh_structures/{name}/        NanobodyBuilder2 rank-0 PDB + CIF
+    docking/{name}/               Boltz2 rigid-body docking results (all diffusion samples)
+    ensemble_binding_scores.csv   Aggregated convergence scores (one row per VHH)
+    ensemble_per_model.csv        Full per-docking-model detail
+    logs/                         Boltz2 stdout/stderr logs
 """
 
 import argparse
@@ -243,20 +239,17 @@ def run_boltz(
     accelerator: str,
     num_models: int,
     no_msa_server: bool,
+    recycling_steps: int = 3,
     max_parallel_samples: int | None = None,
     log_path: Path | None = None,
-    extra_flags: list[str] | None = None,
 ) -> int:
-    """
-    Invoke the boltz CLI.
-    extra_flags: any additional CLI arguments appended verbatim, e.g.
-                 ["--recycling_steps", "1"] for ensemble generation.
-    """
+    """Invoke the boltz CLI."""
     cmd = [
         str(BOLTZ_BIN), "predict", str(input_dir),
         "--out_dir", str(out_dir),
         "--accelerator", accelerator,
         "--diffusion_samples", str(num_models),
+        "--recycling_steps", str(recycling_steps),
         "--model", "boltz2",
         "--write_full_pae",
         "--num_workers", "4",
@@ -266,8 +259,6 @@ def run_boltz(
         cmd += ["--max_parallel_samples", str(max_parallel_samples)]
     if not no_msa_server:
         cmd.append("--use_msa_server")
-    if extra_flags:
-        cmd.extend(extra_flags)
 
     if log_path:
         tqdm.write(f"  → boltz2 log: {log_path}")
@@ -452,216 +443,58 @@ def default_output_dir(input_path: str) -> Path:
 # Stage 1 — NanobodyBuilder2 conformer ensemble
 # ---------------------------------------------------------------------------
 
-def run_immunebuilder_ensemble(sequence: str, name: str, out_dir: Path) -> list[Path]:
+def run_immunebuilder_best(sequence: str, name: str, out_dir: Path) -> Path | None:
     """
-    Run NanoBodyBuilder2, refine all 4 model conformers with OpenMM, and return CIF paths.
+    Run NanoBodyBuilder2, OpenMM-relax the rank-0 (best) model, and return its CIF path.
 
-    NanobodyBuilder2 runs 4 independently pre-trained models on the same sequence,
-    producing 4 deterministic structures that reflect genuine model uncertainty over
-    the CDR3 loop energy landscape.
+    NanobodyBuilder2 ranks its 4 independently pre-trained model outputs; rank-0 is
+    the highest-confidence structure by its internal scoring. That structure is
+    refined with OpenMM (backbone-restrained energy minimisation) then converted to
+    CIF so Boltz2 can parse entity_poly_seq (NanobodyBuilder2 PDBs lack SEQRES).
 
-    All 4 conformers are refined with OpenMM (backbone-restrained energy minimisation)
-    so they enter docking on equal footing. If refinement fails for a conformer, the
-    unrefined structure is kept with a warning. The rank-0 refined structure also
-    serves as the visualisation baseline.
-
-    Each PDB is converted to CIF via prepare_antigen_cif so that Boltz2 can parse
-    SEQRES from entity_poly_seq (NanobodyBuilder2 PDBs lack SEQRES records, which
-    causes Boltz2's mmCIF parser to fail with IndexError on the raw PDB).
-
-    Returns [] if ImmuneBuilder is not installed or prediction fails.
+    Returns None if ImmuneBuilder is not installed or prediction fails.
     """
     try:
         from ImmuneBuilder import NanoBodyBuilder2  # type: ignore
         from ImmuneBuilder.refine import refine      # type: ignore
     except ImportError:
-        tqdm.write("  [Stage 1] ImmuneBuilder not installed — cannot generate conformers.")
-        return []
+        tqdm.write("  [Stage 1] ImmuneBuilder not installed — skipping.")
+        return None
     try:
         builder = NanoBodyBuilder2()
         nanobody = builder.predict({"H": sequence})
 
-        conformers: list[Path] = []
-        for rank, model_idx in enumerate(nanobody.ranking):
-            pdb_path = out_dir / f"{name}_nb2_conformer_{rank + 1}.pdb"
-            nanobody.save_single_unrefined(str(pdb_path), index=model_idx)
-            success = refine(str(pdb_path), str(pdb_path))
-            if success:
-                tqdm.write(f"  [Stage 1] Conformer {rank + 1} refined ✓")
-            else:
-                tqdm.write(f"  [Stage 1] Conformer {rank + 1} refinement failed — using unrefined.")
-            cif_path = prepare_antigen_cif(pdb_path)
-            conformers.append(cif_path)
+        best_idx = nanobody.ranking[0]
+        pdb_path = out_dir / f"{name}_best_model.pdb"
+        nanobody.save_single_unrefined(str(pdb_path), index=best_idx)
 
-        # Rank-0 refined conformer also serves as the visualisation baseline
-        if conformers:
-            shutil.copy2(out_dir / f"{name}_nb2_conformer_1.pdb",
-                         out_dir / f"{name}_baseline.pdb")
-            tqdm.write(f"  [Stage 1] Baseline → {name}_baseline.pdb (rank-0 refined)")
+        success = refine(str(pdb_path), str(pdb_path))
+        if success:
+            tqdm.write(f"  [Stage 1] Best model (rank-0) OpenMM-relaxed ✓ → {pdb_path.name}")
+        else:
+            tqdm.write(f"  [Stage 1] OpenMM refinement failed — using unrefined best model.")
 
-        tqdm.write(f"  [Stage 1] {len(conformers)} NanobodyBuilder2 conformers saved (CIF).")
-        return conformers
+        cif_path = prepare_antigen_cif(pdb_path)
+        tqdm.write(f"  [Stage 1] Best model CIF → {cif_path.name}")
+        return cif_path
     except Exception as e:
         tqdm.write(f"  [Stage 1] NanobodyBuilder2 failed for '{name}': {e}")
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Stage 2 — CDR3 detection & centroid-proximity selection
-# ---------------------------------------------------------------------------
-
-def _get_cdr3_ca_atoms(model) -> list:
-    """
-    Extract CDR3 Cα atoms.
-
-    Chain priority: H (ImmuneBuilder IMGT numbering) then A (Boltz2 output).
-    Residue detection:
-      Primary  — IMGT residues 105–117 (standard CDR3 window for VHHs)
-      Fallback — last 10 residues among the first 130 positions (Kabat proxy)
-    """
-    for chain_id in ("H", "A"):
-        try:
-            chain = model[chain_id]
-        except KeyError:
-            continue
-        atom_res = [r for r in chain.get_residues() if r.id[0] == " "]
-        imgt_cdr3 = [r for r in atom_res if 105 <= r.id[1] <= 117]
-        if len(imgt_cdr3) >= 3:
-            return [r["CA"] for r in imgt_cdr3 if "CA" in r]
-        window = [r for r in atom_res if r.id[1] <= 130]
-        proxy = window[-10:] if len(window) >= 10 else window
-        if proxy:
-            return [r["CA"] for r in proxy if "CA" in r]
-
-    chains = list(model.get_chains())
-    if not chains:
-        return []
-    atom_res = [r for r in chains[0].get_residues() if r.id[0] == " "]
-    proxy = atom_res[-10:] if len(atom_res) >= 10 else atom_res
-    return [r["CA"] for r in proxy if "CA" in r]
-
-
-def _cdr3_rmsd(path_a: Path, path_b: Path) -> float | None:
-    """CDR3-only Cα RMSD between two VHH structures (Å). Returns None on failure."""
-    try:
-        ca_a = _get_cdr3_ca_atoms(load_structure(path_a))
-        ca_b = _get_cdr3_ca_atoms(load_structure(path_b))
-        n = min(len(ca_a), len(ca_b))
-        if n < 3:
-            return None
-        sup = Superimposer()
-        sup.set_atoms(ca_a[:n], ca_b[:n])
-        return round(sup.rms, 3)
-    except Exception as e:
-        tqdm.write(f"  [Stage 2] CDR3 RMSD failed ({path_a.name} vs {path_b.name}): {e}")
         return None
 
 
-def cluster_conformers(
-    conformer_paths: list[Path],
-    threshold: float,
-    max_conformers: int,
-) -> tuple[list[Path], list[dict]]:
-    """
-    Centroid-proximity conformer selection.
-
-    Selects up to max_conformers conformers whose CDR3 geometry is closest to
-    the ensemble medoid (the conformer with the lowest mean pairwise CDR3 RMSD),
-    with a minimum pairwise spacing of `threshold` Å to skip near-exact duplicates.
-
-    This retains physically realistic loop flexibility (small CDR3 deviations that
-    the VHH actually samples in solution) rather than outlier geometries produced
-    by diffusion noise. Convergence of docking results across near-centroid
-    conformers is a true signal of robust antigen binding.
-
-    Returns:
-        representatives — list of selected conformer Paths (centroid-closest first)
-        rmsd_log        — list of dicts with all pairwise CDR3 RMSD comparisons
-    """
-    if not conformer_paths:
-        return [], []
-    if len(conformer_paths) == 1:
-        return [conformer_paths[0]], []
-
-    n = len(conformer_paths)
-
-    # Build full pairwise RMSD matrix
-    rmsd_matrix: list[list[float | None]] = [[None] * n for _ in range(n)]
-    rmsd_log: list[dict] = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            r = _cdr3_rmsd(conformer_paths[i], conformer_paths[j])
-            rmsd_matrix[i][j] = r
-            rmsd_matrix[j][i] = r
-            rmsd_log.append({
-                "conformer_a": conformer_paths[i].name,
-                "conformer_b": conformer_paths[j].name,
-                "cdr3_rmsd": r,
-            })
-
-    # Find medoid: conformer with lowest mean pairwise RMSD to all others
-    mean_rmsds = []
-    for i in range(n):
-        vals = [rmsd_matrix[i][j] for j in range(n) if i != j and rmsd_matrix[i][j] is not None]
-        mean_rmsds.append(float(np.mean(vals)) if vals else float("inf"))
-    medoid_idx = int(np.argmin(mean_rmsds))
-    tqdm.write(
-        f"  [Stage 2] Medoid: {conformer_paths[medoid_idx].name}  "
-        f"(mean pairwise CDR3 RMSD={mean_rmsds[medoid_idx]:.2f} Å)"
-    )
-
-    # Rank all conformers by RMSD to medoid (ascending — closest first)
-    dist_to_medoid: list[tuple[float, int]] = []
-    for i in range(n):
-        d = rmsd_matrix[medoid_idx][i] if rmsd_matrix[medoid_idx][i] is not None else float("inf")
-        dist_to_medoid.append((d, i))
-    dist_to_medoid.sort()
-
-    # Greedy accept: keep closest to centroid, skip near-duplicates (< threshold)
-    accepted_indices: list[int] = []
-    for dist, idx in dist_to_medoid:
-        if len(accepted_indices) >= max_conformers:
-            break
-        too_close = any(
-            rmsd_matrix[idx][a] is not None and rmsd_matrix[idx][a] < threshold
-            for a in accepted_indices
-        )
-        if too_close:
-            tqdm.write(
-                f"  [Stage 2] Skipped  {conformer_paths[idx].name}  "
-                f"(near-duplicate: within {threshold} Å of an accepted conformer)"
-            )
-        else:
-            accepted_indices.append(idx)
-            tqdm.write(
-                f"  [Stage 2] Selected {conformer_paths[idx].name}  "
-                f"(RMSD to centroid={dist:.2f} Å)"
-            )
-
-    representatives = [conformer_paths[i] for i in accepted_indices]
-    return representatives, rmsd_log
-
-
 # ---------------------------------------------------------------------------
-# Stage 3 — Templated Boltz2 docking per conformer
+# Stage 2 — Rigid-body Boltz2 docking
 # ---------------------------------------------------------------------------
 
-_CLASH_RETRY_LIMIT = 3   # max extra Boltz2 runs per clashing model slot
-
-
-def _score_single_model(
+def _score_model(
     pred_dir: Path,
     run_name: str,
     model_idx: int,
     binder_len: int,
     antigen_len: int,
     run_out: Path,
-    dest_model_num: int,
 ) -> dict:
-    """
-    Extract all metrics for one Boltz2 model output. Computes clashes and copies
-    the CIF to run_out with a stable filename. Returns a metric dict.
-    """
+    """Extract all metrics for one Boltz2 diffusion sample. Copies CIF to run_out."""
     conf_path = pred_dir / f"confidence_{run_name}_model_{model_idx}.json"
     pae_path  = pred_dir / f"pae_{run_name}_model_{model_idx}.npz"
     cif_path  = pred_dir / f"{run_name}_model_{model_idx}.cif"
@@ -682,11 +515,12 @@ def _score_single_model(
     else:
         row.update({k: None for k in ["pae_interface", "pae_binder", "pae_antigen"]})
 
+    dest_num = model_idx + 1
     if cif_path.exists():
         row["bsa_A2"] = calculate_bsa(cif_path)
         row.update(count_interface_contacts(cif_path))
         row["n_clashes"] = count_heavy_atom_clashes(cif_path)
-        shutil.copy2(cif_path, run_out / f"{run_name}_model_{dest_model_num}.cif")
+        shutil.copy2(cif_path, run_out / f"{run_name}_model_{dest_num}.cif")
     else:
         row.update({k: None for k in [
             "bsa_A2", "interface_contacts", "n_clashes",
@@ -697,50 +531,9 @@ def _score_single_model(
     return row
 
 
-def _run_single_docking(
-    run_name: str,
-    run_out: Path,
-    binder_seq: str,
-    antigen_seq: str,
-    conformer_path: Path,
-    antigen_cif: Path,
-    use_template: bool,
-    accelerator: str,
-    no_msa_server: bool,
-    log_path: Path,
-    attempt: int = 0,
-) -> tuple[Path | None, Path | None]:
-    """
-    Run Boltz2 for a single diffusion sample (num_models=1).
-    Returns (pred_dir, boltz_out) on success, (None, None) on failure.
-    Boltz2 output is written to a fresh temp subdir to avoid collisions on retry.
-    """
-    retry_out = run_out / f"_boltz_attempt_{attempt}"
-    retry_out.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory() as yaml_tmp:
-        yaml_path = Path(yaml_tmp) / f"{run_name}.yaml"
-        write_complex_yaml(
-            binder_seq, antigen_seq, yaml_path,
-            binder_structure=conformer_path,
-            antigen_structure=antigen_cif if use_template else None,
-        )
-        rc = run_boltz(
-            Path(yaml_tmp), retry_out, accelerator, 1, no_msa_server,
-            max_parallel_samples=1,
-            log_path=log_path,
-        )
-    if rc != 0:
-        return None, None
-    pred_dirs = list(retry_out.glob(f"*/predictions/{run_name}"))
-    if not pred_dirs:
-        return None, None
-    return pred_dirs[0], retry_out
-
-
-def dock_conformer(
+def dock_vhh(
     name: str,
-    conformer_path: Path,
-    conformer_idx: int,
+    best_model_cif: Path,
     binder_seq: str,
     antigen_seq: str,
     antigen_cif: Path,
@@ -753,78 +546,60 @@ def dock_conformer(
     log_dir: Path,
 ) -> list[dict]:
     """
-    Run Boltz2 complex prediction for one VHH conformer against the antigen.
+    Rigid-body Boltz2 docking for one VHH against the antigen.
 
-    Each of the num_models diffusion samples is scored independently. If a model
-    has any steric clashes (heavy-atom cross-chain distance < 1.5 Å), it is
-    discarded and Boltz2 is re-run for that slot, up to _CLASH_RETRY_LIMIT
-    additional attempts. Only clash-free models are kept. If all retries for a
-    slot still produce clashes, the best-scoring clashing attempt is retained
-    and flagged in n_clashes so the report can surface it.
+    The rank-0 OpenMM-relaxed VHH structure (best_model_cif) is provided as a
+    structural template for chain A, fixing its conformation during diffusion.
+    If use_template is True the antigen CIF is also templated (chain B), making
+    the docking fully rigid-body. num_models diffusion samples are run in a
+    single Boltz2 call with recycling_steps=3.
 
-    Returns list of per-model metric dicts (one per accepted diffusion sample).
+    Returns a list of per-model metric dicts (one per diffusion sample).
     """
-    run_name = f"{name}_conformer_{conformer_idx}"
+    run_name = name
     run_out = dock_root / run_name
     run_out.mkdir(parents=True, exist_ok=True)
 
     binder_len  = len(binder_seq)
     antigen_len = len(antigen_seq)
+
+    log_path = log_dir / f"{run_name}.log"
+    with tempfile.TemporaryDirectory() as yaml_tmp:
+        yaml_path = Path(yaml_tmp) / f"{run_name}.yaml"
+        write_complex_yaml(
+            binder_seq, antigen_seq, yaml_path,
+            binder_structure=best_model_cif,
+            antigen_structure=antigen_cif if use_template else None,
+        )
+        rc = run_boltz(
+            Path(yaml_tmp), run_out, accelerator, num_models, no_msa_server,
+            recycling_steps=3,
+            max_parallel_samples=max_parallel_samples,
+            log_path=log_path,
+        )
+
+    if rc != 0:
+        tqdm.write(f"  [Stage 2] Boltz2 failed for '{name}'.")
+        return []
+
+    pred_dirs = list(run_out.glob(f"*/predictions/{run_name}"))
+    if not pred_dirs:
+        tqdm.write(f"  [Stage 2] No Boltz2 prediction directory found for '{name}'.")
+        return []
+    pred_dir = pred_dirs[0]
+
     rows: list[dict] = []
-
-    for slot in range(num_models):
-        dest_model_num = slot + 1
-        best_row: dict | None = None
-        accepted = False
-
-        for attempt in range(_CLASH_RETRY_LIMIT + 1):
-            log_path = log_dir / f"{run_name}_slot{slot}_attempt{attempt}.log"
-            pred_dir, _ = _run_single_docking(
-                run_name=run_name,
-                run_out=run_out,
-                binder_seq=binder_seq,
-                antigen_seq=antigen_seq,
-                conformer_path=conformer_path,
-                antigen_cif=antigen_cif,
-                use_template=use_template,
-                accelerator=accelerator,
-                no_msa_server=no_msa_server,
-                log_path=log_path,
-                attempt=attempt,
-            )
-            if pred_dir is None:
-                tqdm.write(f"  [Stage 3] {run_name} slot {dest_model_num} attempt {attempt+1} — Boltz2 failed.")
-                continue
-
-            row = _score_single_model(
-                pred_dir, run_name, 0,  # single sample → model_0
-                binder_len, antigen_len, run_out, dest_model_num,
-            )
-            n_cl = row.get("n_clashes") or 0
-
-            if best_row is None or (row.get("binding_score") or 0) > (best_row.get("binding_score") or 0):
-                best_row = row
-
-            if n_cl == 0:
-                tqdm.write(f"  [Stage 3] {run_name} model {dest_model_num}: 0 clashes ✓")
-                accepted = True
-                break
-            else:
-                tqdm.write(
-                    f"  [Stage 3] {run_name} model {dest_model_num} attempt {attempt+1}: "
-                    f"{n_cl} clash(es) — retrying…"
-                )
-
-        if best_row is not None:
-            if not accepted:
-                tqdm.write(
-                    f"  [Stage 3] {run_name} model {dest_model_num}: "
-                    f"could not resolve clashes after {_CLASH_RETRY_LIMIT+1} attempts — "
-                    f"keeping best ({best_row.get('n_clashes', '?')} clashes)."
-                )
-            row_out = {"Sample": name, "conformer": conformer_idx, "Model": dest_model_num}
-            row_out.update(best_row)
-            rows.append(row_out)
+    for model_idx in range(num_models):
+        row = _score_model(pred_dir, run_name, model_idx, binder_len, antigen_len, run_out)
+        n_cl = row.get("n_clashes") or 0
+        clash_tag = "✓" if n_cl == 0 else f"{n_cl} clash(es)"
+        tqdm.write(
+            f"  [Stage 2] model {model_idx + 1}/{num_models}: "
+            f"binding_score={row.get('binding_score')}  clashes={clash_tag}"
+        )
+        row_out = {"Sample": name, "conformer": 1, "Model": model_idx + 1}
+        row_out.update(row)
+        rows.append(row_out)
 
     return rows
 
@@ -872,24 +647,19 @@ def compute_epitope_overlap(all_rows: list[dict]) -> float | None:
 def compute_pose_convergence_rmsd(
     dock_root: Path,
     name: str,
-    n_conformers: int,
     n_models: int,
 ) -> float | None:
     """
-    Superimpose the best-model complex from each conformer onto antigen chain B,
-    then report Cα RMSD of binder chain A across the set.
-    Low RMSD = conformers converge on the same binding pose.
-    High RMSD = pose is conformer-dependent = lower confidence.
+    Superimpose all diffusion-sample complexes onto antigen chain B of model 1,
+    then report mean Cα RMSD of binder chain A across samples.
+    Low RMSD = diffusion samples converge on the same pose.
     """
+    run_dir = dock_root / name
     cif_paths = []
-    for k in range(1, n_conformers + 1):
-        run_name = f"{name}_conformer_{k}"
-        run_dir = dock_root / run_name
-        for m in range(1, n_models + 1):
-            p = run_dir / f"{run_name}_model_{m}.cif"
-            if p.exists():
-                cif_paths.append(p)
-                break
+    for m in range(1, n_models + 1):
+        p = run_dir / f"{name}_model_{m}.cif"
+        if p.exists():
+            cif_paths.append(p)
 
     if len(cif_paths) < 2:
         return None
@@ -919,7 +689,7 @@ def compute_pose_convergence_rmsd(
 
         return round(float(np.mean(rmsds)), 3) if rmsds else None
     except Exception as e:
-        tqdm.write(f"  [Stage 4] Pose convergence RMSD failed: {e}")
+        tqdm.write(f"  [Stage 3] Pose convergence RMSD failed: {e}")
         return None
 
 
@@ -1024,29 +794,23 @@ def _clash_label(n: int) -> str:
 
 
 def _find_best_cif(out_dir: Path, name: str, per_model_df: pd.DataFrame) -> str:
-    """
-    Return path to the CIF with the highest binding_score for this VHH.
-    Falls back to the first CIF found, then a placeholder string.
-    """
+    """Return path to the CIF with the highest binding_score for this VHH."""
     dock_root = out_dir / "docking"
+    run_dir = dock_root / name
     subset = per_model_df[per_model_df["Sample"] == name].copy()
     if not subset.empty and "binding_score" in subset.columns:
         subset = subset.sort_values("binding_score", ascending=False)
         for _, model_row in subset.iterrows():
-            k = int(model_row.get("conformer", 1))
             m = int(model_row.get("Model", 1))
-            run_name = f"{name}_conformer_{k}"
-            p = dock_root / run_name / f"{run_name}_model_{m}.cif"
+            p = run_dir / f"{name}_model_{m}.cif"
             if p.exists():
                 return str(p)
     # Fallback: scan for any existing CIF
-    for k in range(1, 10):
-        run_name = f"{name}_conformer_{k}"
-        for m in range(1, 10):
-            p = dock_root / run_name / f"{run_name}_model_{m}.cif"
-            if p.exists():
-                return str(p)
-    return f"{dock_root}/{name}_conformer_1/ (not yet generated)"
+    for m in range(1, 20):
+        p = run_dir / f"{name}_model_{m}.cif"
+        if p.exists():
+            return str(p)
+    return f"{run_dir}/ (not yet generated)"
 
 
 def print_final_report(
@@ -1119,7 +883,7 @@ def print_final_report(
 
     W = 78
     _w("=" * W)
-    _w(" ENSEMBLE VHH DOCKING  —  CANDIDATE REPORT")
+    _w(" VHH–ANTIGEN RIGID-BODY DOCKING  —  CANDIDATE REPORT")
     _w("=" * W)
     _w(f" {len(results_df)} VHH(s) evaluated   "
        f"READY: {len(ready)}   REVIEW: {len(review)}   UNCERTAIN: {len(uncertain)}")
@@ -1325,11 +1089,12 @@ PER_MODEL_COLUMNS = [
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Ensemble VHH docking pipeline.\n\n"
-            "Runs NanobodyBuilder2 to generate 4 model-diverse VHH conformers, "
-            "selects those closest to the CDR3 ensemble centroid, runs templated "
-            "Boltz2 complex prediction for each, and scores binding confidence by "
-            "pose convergence across conformers."
+            "VHH–antigen docking pipeline.\n\n"
+            "Runs NanobodyBuilder2 to generate 4 VHH structures, selects the rank-0 "
+            "(best) model after OpenMM relaxation, then runs rigid-body Boltz2 complex "
+            "prediction with that structure as the VHH template (recycling_steps=3). "
+            "Scores binding confidence by epitope overlap and pose RMSD across diffusion "
+            "samples."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1378,30 +1143,13 @@ def main():
                         "Omit only if the antigen is itself an uncertain prediction."
                     ))
 
-    # ---- Stage 2: conformer selection ----
-    cl = parser.add_argument_group("Stage 2 — CDR3 conformer selection")
-    cl.add_argument("--cdr3-rmsd-threshold", type=float, default=1.5, metavar="Å",
-                    help=(
-                        "Minimum CDR3 Cα RMSD (Å) between any two accepted conformers "
-                        "(deduplication floor). Conformers are selected by proximity to the "
-                        "ensemble centroid (medoid); this threshold prevents near-exact "
-                        "duplicates from being kept. Lower values keep more conformers; "
-                        "higher values keep only more geometrically distinct ones. Default: 1.5"
-                    ))
-    cl.add_argument("--max-conformers", type=int, default=5, metavar="N",
-                    help=(
-                        "Maximum number of diverse conformers to retain after clustering. "
-                        "Each conformer produces one full Boltz2 docking run, so this "
-                        "directly controls Stage 3 GPU cost. Default: 5"
-                    ))
-
-    # ---- Stage 3: docking ----
-    dock = parser.add_argument_group("Stage 3 — Templated Boltz2 docking")
-    dock.add_argument("--num-models", type=int, default=2, metavar="N",
+    # ---- Stage 2: docking ----
+    dock = parser.add_argument_group("Stage 2 — Rigid-body Boltz2 docking")
+    dock.add_argument("--num-models", type=int, default=5, metavar="N",
                       help=(
-                          "Number of Boltz2 diffusion samples per conformer-antigen "
-                          "docking run. Mean ± std are reported across valid models. "
-                          "Default: 2"
+                          "Number of Boltz2 diffusion samples for the rigid-body docking run. "
+                          "All samples use the rank-0 OpenMM-relaxed VHH as a fixed template. "
+                          "Mean ± std are reported across samples. Default: 5"
                       ))
     dock.add_argument("--max-parallel-samples", type=int, default=None, metavar="N",
                       help=(
@@ -1470,17 +1218,15 @@ def main():
     )
 
     print(f"Loaded {total} VHH cluster representatives from '{args.input}'")
-    print(f"  cdr3-rmsd-threshold={args.cdr3_rmsd_threshold} Å  max-conformers={args.max_conformers}")
-    print(f"  num-models={args.num_models}  accelerator={args.accelerator}")
+    print(f"  num-models={args.num_models}  recycling-steps=3  accelerator={args.accelerator}")
     print(f"  use-template={'yes' if args.use_template else 'no'}\n")
 
     # ---- Output directories ----
     out_dir = Path(args.output) if args.output else default_output_dir(args.input)
     vhh_dir  = out_dir / "vhh_structures"
-    rep_dir  = vhh_dir / "representatives"
     dock_dir = out_dir / "docking"
     log_dir  = out_dir / "logs"
-    for d in (out_dir, vhh_dir, rep_dir, dock_dir, log_dir):
+    for d in (out_dir, vhh_dir, dock_dir, log_dir):
         d.mkdir(parents=True, exist_ok=True)
     print(f"Output: {out_dir}\n")
 
@@ -1517,61 +1263,44 @@ def main():
         name_vhh_dir = vhh_dir / name
         name_vhh_dir.mkdir(exist_ok=True)
 
-        # Stage 1 — NanobodyBuilder2 conformer ensemble
-        tqdm.write("\n  -- Stage 1: NanobodyBuilder2 conformer ensemble (4 models) --")
+        # Stage 1 — NanobodyBuilder2: best model only, OpenMM-relaxed
+        tqdm.write("\n  -- Stage 1: NanobodyBuilder2 best model --")
         vhh_bar.set_postfix_str("Stage 1: NanobodyBuilder2")
-        conformers = run_immunebuilder_ensemble(seq, name, name_vhh_dir)
+        best_model_cif = run_immunebuilder_best(seq, name, name_vhh_dir)
 
-        if not conformers:
-            tqdm.write(f"  No conformers generated for '{name}' — skipping.")
+        if best_model_cif is None:
+            tqdm.write(f"  No VHH structure generated for '{name}' — skipping.")
             continue
 
-        # Stage 2 — CDR3 centroid selection
+        # Stage 2 — Rigid-body Boltz2 docking (num_models diffusion samples)
         tqdm.write(
-            f"\n  -- Stage 2: CDR3 centroid selection "
-            f"(dedup-threshold={args.cdr3_rmsd_threshold} Å, max={args.max_conformers}) --"
+            f"\n  -- Stage 2: Rigid-body Boltz2 docking "
+            f"({args.num_models} diffusion samples, recycling_steps=3) --"
         )
-        vhh_bar.set_postfix_str("Stage 2: CDR3 selection")
-        representatives, rmsd_log = cluster_conformers(
-            conformers, args.cdr3_rmsd_threshold, args.max_conformers
+        vhh_bar.set_postfix_str("Stage 2: Boltz2 docking")
+        all_dock_rows = dock_vhh(
+            name=name,
+            best_model_cif=best_model_cif,
+            binder_seq=seq,
+            antigen_seq=antigen_seq,
+            antigen_cif=antigen_cif,
+            dock_root=dock_dir,
+            accelerator=args.accelerator,
+            num_models=args.num_models,
+            no_msa_server=args.no_msa_server,
+            use_template=args.use_template,
+            max_parallel_samples=args.max_parallel_samples,
+            log_dir=log_dir,
         )
-        tqdm.write(
-            f"  [Stage 2] {len(representatives)}/{len(conformers)} conformer(s) selected."
-        )
-
-        for k, rep in enumerate(representatives, 1):
-            shutil.copy2(rep, rep_dir / f"{name}_rep_{k}{rep.suffix}")
-        if rmsd_log:
-            pd.DataFrame(rmsd_log).to_csv(name_vhh_dir / "cdr3_rmsd_log.csv", index=False)
-
-        # Stage 3 — Templated Boltz2 docking
-        tqdm.write(
-            f"\n  -- Stage 3: Templated Boltz2 docking "
-            f"({len(representatives)} conformer(s) × {args.num_models} model(s)) --"
-        )
-        all_dock_rows: list[dict] = []
-        for k, rep_path in enumerate(representatives, 1):
-            vhh_bar.set_postfix_str(f"Stage 3: conformer {k}/{len(representatives)}")
-            tqdm.write(f"\n  Docking conformer {k}/{len(representatives)}: {rep_path.name}")
-            dock_rows = dock_conformer(
-                name=name, conformer_path=rep_path, conformer_idx=k,
-                binder_seq=seq, antigen_seq=antigen_seq, antigen_cif=antigen_cif,
-                dock_root=dock_dir, accelerator=args.accelerator,
-                num_models=args.num_models, no_msa_server=args.no_msa_server,
-                use_template=args.use_template,
-                max_parallel_samples=args.max_parallel_samples,
-                log_dir=log_dir,
-            )
-            all_dock_rows.extend(dock_rows)
 
         per_model_rows.extend(all_dock_rows)
         pd.DataFrame(per_model_rows).reindex(columns=PER_MODEL_COLUMNS).to_csv(
             out_dir / "ensemble_per_model.csv", index=False
         )
 
-        # Stage 4 — Convergence scoring
-        tqdm.write("\n  -- Stage 4: Convergence scoring --")
-        vhh_bar.set_postfix_str("Stage 4: convergence")
+        # Stage 3 — Convergence scoring across diffusion samples
+        tqdm.write("\n  -- Stage 3: Convergence scoring --")
+        vhh_bar.set_postfix_str("Stage 3: convergence")
 
         valid_rows = [r for r in all_dock_rows if r.get("binding_score") is not None]
         if not valid_rows:
@@ -1584,9 +1313,7 @@ def main():
         bsas   = [r["bsa_A2"]        for r in valid_rows if r.get("bsa_A2")        is not None]
 
         epitope_overlap = compute_epitope_overlap(valid_rows)
-        pose_rmsd = compute_pose_convergence_rmsd(
-            dock_dir, name, len(representatives), args.num_models
-        )
+        pose_rmsd = compute_pose_convergence_rmsd(dock_dir, name, args.num_models)
 
         mean_bs  = round(float(np.mean(scores)), 4) if scores else None
         best_bs  = round(float(max(scores)), 4)     if scores else None
@@ -1606,7 +1333,7 @@ def main():
             "Cluster":                  name,
             "sequence":                 seq,
             "Log2_Enrichment":          enrichment,
-            "n_conformers_kept":        len(representatives),
+            "n_conformers_kept":        1,
             "n_docking_runs":           len(all_dock_rows),
             "mean_binding_score":       mean_bs,
             "best_binding_score":       best_bs,

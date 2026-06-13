@@ -33,4 +33,4 @@ protein/bin/pip install -r requirements.txt
 echo ""
 echo "Setup complete."
 echo "Activate with:  source protein/bin/activate"
-echo "Then run:       python boltz_pipeline.py --help"
+echo "Then run:       python ensemble_pipeline.py --help"

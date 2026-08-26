@@ -11,7 +11,8 @@ phage display cluster representatives. Runs three stages automatically:
   Stage 2  Rigid-body Boltz2 docking — runs a two-chain (VHH + antigen) complex
            prediction with the rank-0 VHH as a fixed structural template for
            chain A and (optionally) the antigen as a template for chain B.
-           recycling_steps=3; --num-models diffusion samples (default: 5).
+           --recycling-steps recycling iterations (default: 3); --num-models
+           diffusion samples (default: 5).
   Stage 3  Convergence scoring — epitope overlap + pose RMSD across diffusion
            samples. convergence_rank = epitope_overlap × mean_binding_score.
 
@@ -544,6 +545,7 @@ def dock_vhh(
     use_template: bool,
     max_parallel_samples: int | None,
     log_dir: Path,
+    recycling_steps: int = 3,
 ) -> list[dict]:
     """
     Rigid-body Boltz2 docking for one VHH against the antigen.
@@ -552,7 +554,7 @@ def dock_vhh(
     structural template for chain A, fixing its conformation during diffusion.
     If use_template is True the antigen CIF is also templated (chain B), making
     the docking fully rigid-body. num_models diffusion samples are run in a
-    single Boltz2 call with recycling_steps=3.
+    single Boltz2 call with the given recycling_steps.
 
     Returns a list of per-model metric dicts (one per diffusion sample).
     """
@@ -573,7 +575,7 @@ def dock_vhh(
         )
         rc = run_boltz(
             Path(yaml_tmp), run_out, accelerator, num_models, no_msa_server,
-            recycling_steps=3,
+            recycling_steps=recycling_steps,
             max_parallel_samples=max_parallel_samples,
             log_path=log_path,
         )
@@ -1092,7 +1094,8 @@ def main():
             "VHH–antigen docking pipeline.\n\n"
             "Runs NanobodyBuilder2 to generate 4 VHH structures, selects the rank-0 "
             "(best) model after OpenMM relaxation, then runs rigid-body Boltz2 complex "
-            "prediction with that structure as the VHH template (recycling_steps=3). "
+            "prediction with that structure as the VHH template "
+            "(--recycling-steps, default: 3). "
             "Scores binding confidence by epitope overlap and pose RMSD across diffusion "
             "samples."
         ),
@@ -1157,6 +1160,12 @@ def main():
                           "on the GPU. Reduce if the GPU runs out of memory. "
                           "Default: equal to --num-models."
                       ))
+    dock.add_argument("--recycling-steps", type=int, default=3, metavar="N",
+                      help=(
+                          "Number of Boltz2 recycling iterations per diffusion sample. "
+                          "Higher values can improve structure/confidence convergence at "
+                          "added compute cost per sample. Default: 3"
+                      ))
 
     # ---- Hardware / MSA ----
     hw = parser.add_argument_group("Hardware and MSA")
@@ -1218,7 +1227,7 @@ def main():
     )
 
     print(f"Loaded {total} VHH cluster representatives from '{args.input}'")
-    print(f"  num-models={args.num_models}  recycling-steps=3  accelerator={args.accelerator}")
+    print(f"  num-models={args.num_models}  recycling-steps={args.recycling_steps}  accelerator={args.accelerator}")
     print(f"  use-template={'yes' if args.use_template else 'no'}\n")
 
     # ---- Output directories ----
@@ -1275,7 +1284,7 @@ def main():
         # Stage 2 — Rigid-body Boltz2 docking (num_models diffusion samples)
         tqdm.write(
             f"\n  -- Stage 2: Rigid-body Boltz2 docking "
-            f"({args.num_models} diffusion samples, recycling_steps=3) --"
+            f"({args.num_models} diffusion samples, recycling_steps={args.recycling_steps}) --"
         )
         vhh_bar.set_postfix_str("Stage 2: Boltz2 docking")
         all_dock_rows = dock_vhh(
@@ -1291,6 +1300,7 @@ def main():
             use_template=args.use_template,
             max_parallel_samples=args.max_parallel_samples,
             log_dir=log_dir,
+            recycling_steps=args.recycling_steps,
         )
 
         per_model_rows.extend(all_dock_rows)

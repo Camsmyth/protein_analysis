@@ -11,8 +11,12 @@ phage display cluster representatives. Runs three stages automatically:
   Stage 2  Rigid-body Boltz2 docking — runs a two-chain (VHH + antigen) complex
            prediction with the rank-0 VHH as a fixed structural template for
            chain A and (optionally) the antigen as a template for chain B.
-           --recycling-steps recycling iterations (default: 3); --num-models
-           diffusion samples (default: 5).
+           Chain A never queries the MSA server — it always runs in
+           single-sequence mode (msa: empty), since its conformation is
+           already fixed by the NanobodyBuilder2 template and nanobody CDR
+           loops carry little useful coevolutionary signal. --no-msa-server
+           only affects chain B (the antigen). --recycling-steps recycling
+           iterations (default: 3); --num-models diffusion samples (default: 5).
   Stage 3  Convergence scoring — epitope overlap + pose RMSD across diffusion
            samples. convergence_rank = epitope_overlap × mean_binding_score.
 
@@ -41,7 +45,8 @@ Key flags:
     --enrichment COLUMN       Log2 enrichment column carried to output (default: Log2_Enrichment)
     --num-models N            Diffusion samples for rigid-body docking (default: 5)
     --max-parallel-samples N  GPU memory control for docking
-    --no-msa-server           Disable ColabFold MSA server
+    --no-msa-server           Disable ColabFold MSA server for the antigen (chain A/VHH
+                              never uses it — see Stage 2 above)
     --output DIR              Output root directory
     --accelerator gpu/cpu/tpu
 
@@ -214,6 +219,12 @@ def write_complex_yaml(
         "  - protein:",
         "      id: A",
         f'      sequence: "{binder_seq}"',
+        # Chain A always has a NanobodyBuilder2 template fixing its conformation, and
+        # nanobody CDR loops carry little useful coevolutionary signal — MSA and
+        # template are additive in Boltz2, not exclusive, so skip the (novel,
+        # proprietary) VHH MSA server call entirely rather than relying on
+        # --no-msa-server.
+        "      msa: empty",
         "  - protein:",
         "      id: B",
         f'      sequence: "{antigen_seq}"',
@@ -1173,8 +1184,11 @@ def main():
                     help="Hardware accelerator for Boltz2. Default: gpu")
     hw.add_argument("--no-msa-server", action="store_true",
                     help=(
-                        "Disable the ColabFold MSA server. Use only when pre-computed "
-                        "MSAs are available or for offline runs."
+                        "Disable the ColabFold MSA server for the antigen (chain B). "
+                        "The VHH (chain A) never uses the MSA server regardless of this "
+                        "flag — it always runs in single-sequence mode since its "
+                        "conformation is already fixed by the NanobodyBuilder2 template. "
+                        "Use only when pre-computed MSAs are available or for offline runs."
                     ))
 
     args = parser.parse_args()

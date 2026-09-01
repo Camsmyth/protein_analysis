@@ -32,6 +32,10 @@ SCRIPTS OVERVIEW
   interface_remodeling.py   CDR alanine/glycine scan + hotspot-guided
                              mutation optimisation, starting from a validated
                              ensemble_pipeline.py complex.
+  manual_mutant_scan.py     Score your own hand-designed mutant sequences
+                             (FASTA) against a validated WT complex, using
+                             the same WT-pose-templated docking strategy as
+                             interface_remodeling.py.
   biophysical_analysis.py   Sequence-level biophysical properties (MW, pI,
                              GRAVY, etc.) — no structure prediction.
   nanobody_structure.py     Standalone NanobodyBuilder2 runner (structures
@@ -49,8 +53,9 @@ SCRIPTS OVERVIEW
                              Imported by boltz_pipeline.py; not run directly.
 
 Most users only need ensemble_pipeline.py (triage) and, for promising hits,
-interface_remodeling.py (mutation optimisation). The others are standalone
-utilities kept for lighter-weight or exploratory use.
+interface_remodeling.py (automated mutation optimisation) or
+manual_mutant_scan.py (scoring your own hand-picked mutants). The others are
+standalone utilities kept for lighter-weight or exploratory use.
 
 
 ================================================================================
@@ -418,7 +423,71 @@ Outputs (under --output, e.g. ./Cluster_12_model_1/):
 
 
 ================================================================================
-3. biophysical_analysis.py — SEQUENCE BIOPHYSICAL PROPERTIES
+3. manual_mutant_scan.py — SCORE YOUR OWN MUTANT SEQUENCES
+================================================================================
+
+Takes a FASTA of one or more hand-designed mutant VHH sequences and a
+validated WT complex (--wt-cif), and docks each mutant templated on that
+same complex for both chains — the same WT-pose-templated docking strategy
+interface_remodeling.py uses for its automated CDR scan, applied here to
+sequences you supply directly instead of an Ala/Gly or enhancement panel.
+Use this when you want to test specific mutations (e.g. combinations, or
+substitutions outside the standard scan panels) rather than running the
+full automated scan.
+
+The WT sequence (read from chain A of --wt-cif) is rescored under identical
+conditions, giving a binding_score baseline so each mutant's
+binding_score_delta is a like-for-like comparison.
+
+Usage:
+  python manual_mutant_scan.py --fasta my_mutants.fasta \
+      --wt-cif validated/Cluster_12_model_1.cif
+  python manual_mutant_scan.py --fasta my_mutants.fasta \
+      --wt-cif validated/Cluster_12_model_1.cif \
+      --num-models 10 --recycling-steps 5 --output my_mutants_out/
+
+FASTA input:
+  One or more mutant VHH sequences, e.g.:
+    >I33A_S57Y
+    QVQLVESGGGLVQAGGSLRLSCAASGRTFSSYAMG...
+  Each sequence is docked independently, templated on --wt-cif for both
+  chains. The FASTA header becomes the variant's name in the report and
+  output filenames.
+
+Flags:
+  --fasta PATH          FASTA file of mutant VHH sequences. Required.
+  --wt-cif PATH         Validated WT complex (chain A = VHH, chain B =
+                        antigen), used as the fixed pose template for the
+                        WT rescore and every mutant. Required.
+  --num-models N        Diffusion samples per docking run. Default: 5
+  --recycling-steps N   Boltz2 recycling iterations per sample. Default: 5
+                        (note: higher than interface_remodeling.py's
+                        default of 3, deliberately, for this script)
+  --max-parallel-samples N   Maximum diffusion samples run in parallel on the GPU.
+  --accelerator gpu|cpu|tpu   Default: gpu
+  --no-msa-server        Disable the ColabFold MSA server for the antigen chain.
+  --output DIR           Output root directory.
+                         Default: a directory named after --fasta's basename, in the cwd.
+
+Outputs (under --output):
+  docking/{variant}/        Boltz2 rigid-body docking results per mutant,
+                             plus the WT rescoring run.
+  best_structures/           WT.cif (the input --wt-cif, copied in as-is),
+                             WT_rescored.cif (its best-scoring model from the
+                             WT rescore), and one CIF per mutant named after
+                             its FASTA header — load this directory directly
+                             in a structure viewer to compare mutants
+                             against the WT.
+  scoring_report.txt         Human-readable summary: WT baseline, then one
+                             block per mutant with binding_score,
+                             binding_score_delta, ipTM, BSA, and clashes,
+                             ranked by binding_score_delta (ascending —
+                             biggest drops first).
+  logs/                      Boltz2 stdout/stderr logs
+
+
+================================================================================
+4. biophysical_analysis.py — SEQUENCE BIOPHYSICAL PROPERTIES
 ================================================================================
 
 Computes molecular weight, pI, GRAVY, aromaticity, aliphatic index, and
@@ -443,7 +512,7 @@ rather than aborting the whole run.
 
 
 ================================================================================
-4. nanobody_structure.py — STANDALONE NANOBODYBUILDER2 RUNNER
+5. nanobody_structure.py — STANDALONE NANOBODYBUILDER2 RUNNER
 ================================================================================
 
 Runs ImmuneBuilder's NanoBodyBuilder2 on every sequence in a FASTA file,
@@ -469,7 +538,7 @@ Output per sequence (in --output/{name}/):
 
 
 ================================================================================
-5. boltz_dock.py — LIGHTWEIGHT SINGLE-COMPLEX DOCKING
+6. boltz_dock.py — LIGHTWEIGHT SINGLE-COMPLEX DOCKING
 ================================================================================
 
 Simple Boltz2 rigid-body docking of one nanobody structure file against one
@@ -510,7 +579,7 @@ the terminal, written flat into --output/.
 
 
 ================================================================================
-6. boltz_pipeline.py — BATCH SINGLE-CHAIN STRUCTURE PREDICTION
+7. boltz_pipeline.py — BATCH SINGLE-CHAIN STRUCTURE PREDICTION
 ================================================================================
 
 Bare Boltz2 structure prediction (no docking, no NanobodyBuilder2) for every
@@ -564,6 +633,7 @@ DIRECTORY STRUCTURE
   ├── README.txt
   ├── ensemble_pipeline.py        <- Main pipeline (use this first)
   ├── interface_remodeling.py     <- Mutation scan/optimisation (use on hits)
+  ├── manual_mutant_scan.py       <- Score your own hand-designed mutants
   ├── biophysical_analysis.py
   ├── nanobody_structure.py
   ├── boltz_dock.py

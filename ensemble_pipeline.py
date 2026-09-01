@@ -20,6 +20,12 @@ phage display cluster representatives. Runs three stages automatically:
   Stage 3  Convergence scoring — epitope overlap + pose RMSD across diffusion
            samples. convergence_rank = epitope_overlap × mean_binding_score.
 
+Experimental: --flexible-cdr-template replaces the fully-rigid VHH template with
+one that strips residues where NanobodyBuilder2's own 4-model ensemble disagrees
+(per-residue Cα spread above --flexible-template-cutoff, default 2.0 Å), leaving
+those residues free for Boltz2 to diffuse instead of frozen at a possibly-wrong
+guess. Off by default; does not change behaviour unless passed.
+
 Input CSV columns (configurable via flags):
   Cluster              — cluster representative name  (--names)
   Protein_Sequence_R2  — VHH amino acid sequence       (--sequences)
@@ -49,11 +55,20 @@ Key flags:
                               never uses it — see Stage 2 above)
     --output DIR              Output root directory
     --accelerator gpu/cpu/tpu
+    --flexible-cdr-template   Experimental: strip high-uncertainty residues from the
+                              VHH template instead of rigidly templating all of it
+    --flexible-template-cutoff ANGSTROM   Å cutoff for the above (default: 2.0)
+    --flexible-template-min-run N         Min consecutive flagged residues to strip (default: 1)
 
 Outputs (under --output):
-    vhh_structures/{name}/        NanobodyBuilder2 rank-0 PDB + CIF
+    vhh_structures/{name}/        NanobodyBuilder2 rank-0 PDB + CIF (plus
+                                   {name}_flexible_template.cif when
+                                   --flexible-cdr-template stripped residues)
     docking/{name}/               Boltz2 rigid-body docking results (all diffusion samples)
-    ensemble_binding_scores.csv   Aggregated convergence scores (one row per VHH)
+    ensemble_binding_scores.csv   Aggregated convergence scores (one row per VHH).
+                                   n_flexible_residues_stripped / flexible_residues_stripped
+                                   columns are populated only when --flexible-cdr-template
+                                   was used, otherwise blank.
     ensemble_per_model.csv        Full per-docking-model detail
     logs/                         Boltz2 stdout/stderr logs
 """
@@ -69,7 +84,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from Bio.PDB import MMCIFParser, PDBParser, SASA, Superimposer
+from Bio.PDB import MMCIFParser, PDBIO, PDBParser, SASA, Superimposer
 from Bio.SeqUtils import seq1
 from tqdm import tqdm
 
@@ -494,6 +509,137 @@ def run_immunebuilder_best(sequence: str, name: str, out_dir: Path) -> Path | No
         return None
 
 
+# Per-residue 4-model Cα spread (Å) above which a residue is stripped from the
+# template when --flexible-cdr-template is set. See run_immunebuilder_best_flexible.
+_FLEXIBLE_TEMPLATE_ERROR_CUTOFF_A = 2.0
+
+
+def run_immunebuilder_best_flexible(
+    sequence: str, name: str, out_dir: Path,
+) -> tuple[Path, dict[tuple[int, str], float]] | tuple[None, None]:
+    """
+    Like run_immunebuilder_best(), but additionally returns the per-residue 4-model
+    Cα spread (Å) -- the same quantity ImmuneBuilder's own add_errors_as_bfactors
+    utility writes as a B-factor -- needed for --flexible-cdr-template.
+
+    Deliberately a separate function (not a modified run_immunebuilder_best()) so
+    the default code path used when --flexible-cdr-template is not set is
+    guaranteed byte-for-byte unchanged.
+
+    Returns (None, None) if ImmuneBuilder is not installed or prediction fails.
+    """
+    try:
+        from ImmuneBuilder import NanoBodyBuilder2  # type: ignore
+        from ImmuneBuilder.refine import refine      # type: ignore
+    except ImportError:
+        tqdm.write("  [Stage 1] ImmuneBuilder not installed — skipping.")
+        return None, None
+    try:
+        builder = NanoBodyBuilder2()
+        nanobody = builder.predict({"H": sequence})
+
+        best_idx = nanobody.ranking[0]
+        pdb_path = out_dir / f"{name}_best_model.pdb"
+        nanobody.save_single_unrefined(str(pdb_path), index=best_idx)
+
+        # Per-residue 4-model Cα spread, keyed by IMGT (resnum, icode) -- the
+        # `nanobody` object is only in scope here, so this must be captured before
+        # refinement. Residue IDs are preserved through refinement (refine.py uses
+        # keepIds=True), so this mapping stays valid on the refined structure below.
+        per_residue_error = nanobody.error_estimates.mean(0).sqrt().cpu().numpy()
+        numbered_h = nanobody.numbered_sequences["H"]
+        error_by_residue = {
+            (resnum, icode): float(err)
+            for ((resnum, icode), _aa), err in zip(numbered_h, per_residue_error)
+        }
+
+        success = refine(str(pdb_path), str(pdb_path))
+        if success:
+            tqdm.write(f"  [Stage 1] Best model (rank-0) OpenMM-relaxed ✓ → {pdb_path.name}")
+        else:
+            tqdm.write(f"  [Stage 1] OpenMM refinement failed — using unrefined best model.")
+
+        cif_path = prepare_antigen_cif(pdb_path)
+        tqdm.write(f"  [Stage 1] Best model CIF → {cif_path.name}")
+        return cif_path, error_by_residue
+    except Exception as e:
+        tqdm.write(f"  [Stage 1] NanobodyBuilder2 failed for '{name}': {e}")
+        return None, None
+
+
+def strip_high_uncertainty_residues(
+    structure_path: Path,
+    error_by_residue: dict[tuple[int, str], float],
+    out_path: Path,
+    cutoff_a: float = _FLEXIBLE_TEMPLATE_ERROR_CUTOFF_A,
+    min_run: int = 1,
+    chain_id: str = "H",
+) -> tuple[Path, list[tuple[int, str]]]:
+    """
+    Write a copy of structure_path with high-uncertainty residues deleted, for use
+    as a partial (flexible-CDR) Boltz2 template. Boltz2 has no per-residue template
+    flexibility control -- its template-to-query matching is a sequence alignment
+    against whatever residues are physically present in the template file, so a
+    residue absent from the template gets no coordinate prior and is freely
+    diffused rather than frozen at NanobodyBuilder2's (possibly wrong) guess.
+
+    Must be called on the OpenMM-refined structure, never before refinement --
+    PDBFixer's findMissingResidues/addMissingAtoms (run unconditionally inside
+    ImmuneBuilder's refine_once) would otherwise detect a gap introduced by
+    stripping first and rebuild approximate coordinates for it, defeating the
+    purpose entirely.
+
+    Runs of fewer than min_run consecutive flagged residues are not stripped, to
+    avoid fragmenting the template with isolated single-residue noise spikes.
+
+    Always writes an intermediate PDB and routes it through prepare_antigen_cif()
+    for the final CIF, regardless of out_path's suffix -- Biopython's MMCIFIO alone
+    omits the _entity/_entity_poly blocks Boltz2's parse_mmcif requires (it indexes
+    entities by subchain id and KeyErrors when that block is absent), the same class
+    of problem prepare_antigen_cif() already solves for antigen PDBs via gemmi's
+    setup_entities().
+
+    Returns (out_path, sorted list of (resnum, icode) actually stripped). Returns
+    (structure_path, []) unchanged if nothing exceeds the cutoff.
+    """
+    model = load_structure(structure_path)
+    chain = model[chain_id] if chain_id in model else next(iter(model))
+    residues = [r for r in chain if r.id[0] == " "]
+
+    flagged_set = {
+        r.id[1:] for r in residues
+        if error_by_residue.get((r.id[1], r.id[2]), 0.0) > cutoff_a
+    }
+
+    # Collapse to runs of >= min_run consecutive flagged residues.
+    to_strip: set[tuple[int, str]] = set()
+    run: list[tuple[int, str]] = []
+    for r in residues:
+        key = r.id[1:]
+        if key in flagged_set:
+            run.append(key)
+        else:
+            if len(run) >= min_run:
+                to_strip.update(run)
+            run = []
+    if len(run) >= min_run:
+        to_strip.update(run)
+
+    if not to_strip:
+        return structure_path, []
+
+    for key in to_strip:
+        chain.detach_child((" ",) + key)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pdb_path = out_path.with_suffix(".pdb")
+    io = PDBIO()
+    io.set_structure(model)
+    io.save(str(pdb_path))
+    cif_path = prepare_antigen_cif(pdb_path)
+    return cif_path, sorted(to_strip)
+
+
 # ---------------------------------------------------------------------------
 # Stage 2 — Rigid-body Boltz2 docking
 # ---------------------------------------------------------------------------
@@ -563,6 +709,9 @@ def dock_vhh(
 
     The rank-0 OpenMM-relaxed VHH structure (best_model_cif) is provided as a
     structural template for chain A, fixing its conformation during diffusion.
+    When --flexible-cdr-template was used, best_model_cif may instead be a partial
+    template with high-uncertainty residues removed (see strip_high_uncertainty_residues),
+    leaving those residues free for Boltz2 to diffuse rather than rigidly fixed.
     If use_template is True the antigen CIF is also templated (chain B), making
     the docking fully rigid-body. num_models diffusion samples are run in a
     single Boltz2 call with the given recycling_steps.
@@ -975,6 +1124,11 @@ def print_final_report(
         _w(f"  │  Biophysical MW: {mw}   pI: {pi}   charge(pH 7.4): {chg}   GRAVY: {gravy}")
         if liabs:
             _w(f"  │  Liabilities {liab_s}")
+        n_flex = r.get("n_flexible_residues_stripped")
+        if n_flex:
+            flex_residues = r.get("flexible_residues_stripped", "")
+            _w(f"  │  Flexible template  {n_flex} residue(s) stripped "
+               f"(>{_FLEXIBLE_TEMPLATE_ERROR_CUTOFF_A} Å 4-model spread): {flex_residues}")
         _w(f"  │  Enrichment  log2FC: {enrich}   −log10(FDR): {fdr}   "
            f"R2 count: {count_r2_s}   cluster size: {uniq_s} seqs")
         _w(f"  │")
@@ -1081,6 +1235,7 @@ SUMMARY_COLUMNS = [
     "mean_pae_interface", "mean_bsa_A2",
     "epitope_overlap_fraction", "pose_convergence_rmsd",
     "convergence_rank",
+    "n_flexible_residues_stripped", "flexible_residues_stripped",
 ]
 
 PER_MODEL_COLUMNS = [
@@ -1156,6 +1311,30 @@ def main():
                         "the antigen structure is experimentally determined (PDB/AlphaFold). "
                         "Omit only if the antigen is itself an uncertain prediction."
                     ))
+
+    # ---- Stage 1: confidence-guided flexible template (experimental, opt-in) ----
+    templ = parser.add_argument_group("Stage 1 — Confidence-guided flexible template")
+    templ.add_argument("--flexible-cdr-template", action="store_true",
+        help=(
+            "Experimental. Strip high-uncertainty residues (per NanobodyBuilder2's own "
+            "4-model Cα spread) from the VHH template before Boltz2 docking, instead of "
+            "rigidly templating the entire VHH. Stripped residues are freely diffused by "
+            "Boltz2 rather than frozen at NanobodyBuilder2's possibly-wrong guess. Off by "
+            "default -- compare against the default rigid-template behaviour before "
+            "relying on this for triage decisions."
+        ))
+    templ.add_argument("--flexible-template-cutoff", type=float,
+        default=_FLEXIBLE_TEMPLATE_ERROR_CUTOFF_A, metavar="ANGSTROM",
+        help=(
+            "Per-residue 4-model Cα spread (Å) above which a residue is stripped from "
+            "the template. Only used with --flexible-cdr-template. "
+            f"Default: {_FLEXIBLE_TEMPLATE_ERROR_CUTOFF_A}"
+        ))
+    templ.add_argument("--flexible-template-min-run", type=int, default=1, metavar="N",
+        help=(
+            "Minimum consecutive high-uncertainty residues required before stripping "
+            "them (suppresses stripping isolated single-residue noise). Default: 1"
+        ))
 
     # ---- Stage 2: docking ----
     dock = parser.add_argument_group("Stage 2 — Rigid-body Boltz2 docking")
@@ -1289,11 +1468,36 @@ def main():
         # Stage 1 — NanobodyBuilder2: best model only, OpenMM-relaxed
         tqdm.write("\n  -- Stage 1: NanobodyBuilder2 best model --")
         vhh_bar.set_postfix_str("Stage 1: NanobodyBuilder2")
-        best_model_cif = run_immunebuilder_best(seq, name, name_vhh_dir)
+        stripped_residues: list[tuple[int, str]] = []
+        if args.flexible_cdr_template:
+            best_model_cif, error_by_residue = run_immunebuilder_best_flexible(seq, name, name_vhh_dir)
+        else:
+            best_model_cif = run_immunebuilder_best(seq, name, name_vhh_dir)
+            error_by_residue = None
 
         if best_model_cif is None:
             tqdm.write(f"  No VHH structure generated for '{name}' — skipping.")
             continue
+
+        template_cif = best_model_cif
+        if args.flexible_cdr_template and error_by_residue:
+            flex_path = name_vhh_dir / f"{name}_flexible_template.cif"
+            template_cif, stripped_residues = strip_high_uncertainty_residues(
+                best_model_cif, error_by_residue, flex_path,
+                cutoff_a=args.flexible_template_cutoff,
+                min_run=args.flexible_template_min_run,
+            )
+            if stripped_residues:
+                tqdm.write(
+                    f"  [Stage 1] Flexible template: stripped {len(stripped_residues)} "
+                    f"high-uncertainty residue(s) (>{args.flexible_template_cutoff} Å): "
+                    f"{stripped_residues}"
+                )
+            else:
+                tqdm.write(
+                    f"  [Stage 1] Flexible template: no residues exceeded "
+                    f"{args.flexible_template_cutoff} Å — template unchanged."
+                )
 
         # Stage 2 — Rigid-body Boltz2 docking (num_models diffusion samples)
         tqdm.write(
@@ -1303,7 +1507,7 @@ def main():
         vhh_bar.set_postfix_str("Stage 2: Boltz2 docking")
         all_dock_rows = dock_vhh(
             name=name,
-            best_model_cif=best_model_cif,
+            best_model_cif=template_cif,
             binder_seq=seq,
             antigen_seq=antigen_seq,
             antigen_cif=antigen_cif,
@@ -1369,6 +1573,13 @@ def main():
             "epitope_overlap_fraction": epitope_overlap,
             "pose_convergence_rmsd":    pose_rmsd,
             "convergence_rank":         conv_rank,
+            "n_flexible_residues_stripped": (
+                len(stripped_residues) if args.flexible_cdr_template else None
+            ),
+            "flexible_residues_stripped": (
+                ",".join(f"{n}{ic}".strip() for n, ic in stripped_residues)
+                if args.flexible_cdr_template else None
+            ),
         })
 
         pd.DataFrame(summary_rows).reindex(columns=summary_cols).to_csv(

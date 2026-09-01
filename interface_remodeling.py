@@ -10,11 +10,14 @@ complex for BOTH chains, so mutants are scored on the same fixed epitope
 and binding pose as the input rather than risking a fresh, possibly wrong,
 pose from scratch.
 
-This intentionally does not re-dock a wild-type baseline with Boltz2: Boltz2
-diffusion is not guaranteed to converge on the correct pose, so re-deriving
-the baseline here would let a bad WT pose propagate into every mutant's
-score. Instead, the input --complex-cif is trusted as ground truth for the
-epitope and binding mode, and every mutant is anchored to it.
+This intentionally does not use a fresh, independently-sampled Boltz2 pose as
+ground truth for the epitope/binding mode: Boltz2 diffusion is not guaranteed
+to converge on the correct pose, so deriving the reference pose here would
+let a bad pose propagate into every mutant's score. Instead, the input
+--complex-cif is trusted as ground truth for the epitope and binding mode,
+and every mutant -- including the WT itself, rescored for a baseline -- is
+docked templated on it, so all scores come from the same pose/conditions and
+are directly comparable.
 
 Pipeline:
   Stage 0  Load --complex-cif, extract chain A (binder) and chain B
@@ -24,6 +27,13 @@ Pipeline:
            docking) via ensemble_pipeline.py's contact/BSA/clash geometry
            functions. Used later for round-2 classification, not as a
            pre-filter on round 1.
+  Stage 1b WT rescoring: the WT sequence itself (identity "mutation") is
+           docked with Boltz2 under the exact same templated-on-both-chains
+           conditions as every mutant (see Stage 3). Its mean_binding_score
+           becomes the baseline for binding_score_delta -- comparing a
+           mutant's Boltz2 score against a Boltz2 score computed the same
+           way, rather than one sourced externally (e.g. a different
+           ensemble_pipeline.py run with different settings).
   Stage 2  Mutation generation: every residue in the selected CDR loop(s) is
            scanned to alanine (or glycine, if already alanine) -- the whole
            CDR panel, not just residues already flagged as interface-
@@ -36,7 +46,8 @@ Pipeline:
            position). No fresh NanobodyBuilder2 run per mutant is needed
            since the mutant differs from the template by one residue and
            Boltz2's template alignment is sequence-based, not exact-match.
-  Stage 4  Results are reported, ranked by mean_binding_score.
+  Stage 4  Results are reported, ranked by binding_score_delta (ascending --
+           biggest drops first).
   Stage 5  (--optimize only) Each round-1 position is classified as
            hotspot (interface-contacting, score drops well below the round-1
            panel median -- left alone), tolerant_contact (interface-
@@ -54,21 +65,17 @@ and reference scores are directly comparable.
 
 Usage:
     python interface_remodeling.py --complex-cif validated/Cluster_12_model_1.cif
-    python interface_remodeling.py --complex-cif validated/Cluster_12_model_1.cif \\
-        --wt-binding-score 0.812 --optimize
+    python interface_remodeling.py --complex-cif validated/Cluster_12_model_1.cif --optimize
 
 Key flags:
     --complex-cif PATH      Validated two-chain VHH+antigen complex (chain A =
-                             binder, chain B = antigen). Required.
-    --wt-binding-score SCORE  Known WT binding_score (e.g. from
-                               ensemble_binding_scores.csv) to compute
-                               binding_score_delta per mutant. Optional --
-                               without it, only absolute mean_binding_score
-                               is reported (a static reference CIF has no
-                               Boltz2 confidence JSON of its own).
+                             binder, chain B = antigen). Required. Also used
+                             as the source of the WT sequence, which is
+                             rescored (Stage 1b) as the binding_score_delta
+                             baseline.
     --cdrs 1 2 3             Which CDR loops to scan (default: all three)
     --optimize               Run the round-2 enhancement panel (see Stage 5)
-    --hotspot-drop-fraction F  Hotspot classification threshold (default: 0.15)
+    --hotspot-drop-fraction F  Hotspot classification threshold (default: 0.075)
     --num-models N           Diffusion samples per mutant docking run (default: 5)
     --recycling-steps N      Boltz2 recycling iterations per sample (default: 3)
     --max-parallel-samples N
@@ -78,18 +85,20 @@ Key flags:
 
 Outputs (under --output, which defaults to a directory named after the CIF's
 own basename, e.g. ./Cluster_12_model_1/):
-    docking/{variant}/       Boltz2 rigid-body docking results per mutant
-    best_structures/          WT.cif (the input --complex-cif, copied in as the
-                               reference) plus one CIF per mutant named after
-                               its single-residue mutation, e.g. I33A.cif --
-                               load this directory directly in a structure
-                               viewer to compare mutants against the WT.
+    docking/{variant}/       Boltz2 rigid-body docking results per mutant,
+                              plus the WT rescoring run itself.
+    best_structures/          WT.cif (the input --complex-cif, copied in
+                               as-is) and WT_rescored.cif (its best-scoring
+                               model from Stage 1b's Boltz2 rescoring) plus
+                               one CIF per mutant named after its single-
+                               residue mutation, e.g. I33A.cif -- load this
+                               directory directly in a structure viewer to
+                               compare mutants against the WT.
                                Override with --vis-dir.
     mutation_candidates.csv   One row per mutant (round1, and round2 if
-                               --optimize was used). Ranked by
-                               binding_score_delta if --wt-binding-score was
-                               given (ascending -- biggest drops first),
-                               otherwise by mean_binding_score (descending).
+                               --optimize was used), ranked by
+                               binding_score_delta (ascending -- biggest
+                               drops first) against the Stage 1b WT rescore.
                                Round column and Position_label
                                (hotspot/tolerant_contact/cold_spot, round2
                                rows only) identify which stage/classification
@@ -234,7 +243,7 @@ ENHANCEMENT_PANEL = ["Y", "R", "W", "D", "S", "H", "S", "Q","T","G"]
 # marks it a hotspot (mutating further is not attempted). Relative to the
 # panel's own median rather than an absolute cutoff, since binding_score scale
 # varies VHH to VHH.
-_HOTSPOT_DROP_FRACTION = 0.10
+_HOTSPOT_DROP_FRACTION = 0.075
 
 
 def classify_positions(
@@ -410,10 +419,12 @@ def run_mutant_panel(
     (variant_name, seq_idx, wt_aa, mut_aa, cdr_label); a sixth optional field
     (position_label) is carried through to the results if present.
 
-    wt_binding_score (from --wt-binding-score) is independent of hotspot
+    wt_binding_score is the WT's own mean_binding_score from rescoring it under
+    identical templated-docking conditions (see Stage 1b in main()) -- kept as
+    a separate parameter (rather than looked up globally) so this function has
+    no hidden dependency on run order. It is independent of hotspot
     classification (see classify_positions, which derives its own bar from
-    the round-1 panel's median) -- it only drives the binding_score_delta
-    column here, so --optimize still works without a known WT score.
+    the round-1 panel's median); it only drives the binding_score_delta column.
     """
     results = []
     for i, mutant in enumerate(mutants, 1):
@@ -492,16 +503,6 @@ def main():
                          "ensemble_pipeline.py's docking output. Used as the fixed "
                          "reference pose for interface detection and as a template "
                          "for every mutant."
-                     ))
-    ref.add_argument("--wt-binding-score", type=float, default=None, metavar="SCORE",
-                     help=(
-                         "Known binding_score for the wild-type complex (e.g. from the "
-                         "ensemble_binding_scores.csv row this --complex-cif came from). "
-                         "If given, each mutant's mutation_candidates.csv row includes "
-                         "binding_score_delta = mean_binding_score - this value. If "
-                         "omitted, binding_score_delta is left blank -- a static reference "
-                         "CIF has no Boltz2 confidence JSON, so there is no WT binding_score "
-                         "to diff against unless one is supplied here."
                      ))
 
     scan = parser.add_argument_group("Mutation scan")
@@ -609,6 +610,32 @@ def main():
     print(f"Reference geometry: bsa_A2={ref_metrics['bsa_A2']}  "
           f"n_clashes={ref_metrics['n_clashes']}\n")
 
+    # ---- Stage 1b: rescore the WT itself under the same templated docking mode used
+    # for every mutant, so binding_score_delta compares like with like rather than
+    # mixing a Boltz2-scored mutant against a manually supplied or externally-sourced
+    # WT score. ----
+    print("Stage 1b: rescoring WT (identity sequence) under mutant docking conditions...")
+    wt_rows = dock_mutant(
+        f"{wt_name}_WT", wt_seq, antigen_seq, complex_cif, dock_dir, log_dir, args,
+    )
+    if not wt_rows:
+        sys.exit(
+            "Error: WT rescoring failed (no Boltz2 output) -- cannot establish a "
+            "binding_score baseline for mutant deltas."
+        )
+    wt_summary = summarize_rows(wt_rows)
+    wt_binding_score = wt_summary["mean_binding_score"]
+    if wt_binding_score is None:
+        sys.exit("Error: WT rescoring produced no binding_score -- check the Boltz2 logs.")
+
+    wt_best = best_row(wt_rows)
+    if wt_best is not None:
+        wt_rescore_safe_name = make_safe_name(f"{wt_name}_WT")
+        wt_src = model_cif_path(dock_dir, wt_rescore_safe_name, wt_best["Model"])
+        copy_structure(wt_src, vis_dir, "WT_rescored.cif")
+    print(f"WT rescored: mean_binding_score={wt_binding_score}  "
+          f"mean_iptm={wt_summary['mean_iptm']}  mean_bsa_A2={wt_summary['mean_bsa_A2']}\n")
+
     # ---- Stage 2: generate round-1 (Ala/Gly) mutants across the whole CDR panel ----
     mutants = generate_ala_scan_mutants(wt_seq, regions, cdrs_to_scan)
     if not mutants:
@@ -623,7 +650,7 @@ def main():
     results = run_mutant_panel(
         mutants, wt_seq, wt_name, antigen_seq, complex_cif,
         dock_dir, log_dir, vis_dir, ref_metrics, args, round_label="round1",
-        wt_binding_score=args.wt_binding_score,
+        wt_binding_score=wt_binding_score,
     )
 
     # ---- Stage 5 (optional): classify positions, run enhancement panel ----
@@ -644,7 +671,7 @@ def main():
             round2_results = run_mutant_panel(
                 enhancement_mutants, wt_seq, wt_name, antigen_seq, complex_cif,
                 dock_dir, log_dir, vis_dir, ref_metrics, args, round_label="round2",
-                wt_binding_score=args.wt_binding_score,
+                wt_binding_score=wt_binding_score,
             )
             results += round2_results
         else:
@@ -652,22 +679,21 @@ def main():
                   "every scanned position was classified as a hotspot.\n")
 
     # ---- Stage 4: report ----
-    have_delta = args.wt_binding_score is not None
     out_df = pd.DataFrame(results)
     if not out_df.empty:
-        if have_delta:
-            # Ascending: biggest drops (hotspots) surface first, matching alanine-scan convention.
-            out_df = out_df.sort_values("binding_score_delta", ascending=True, na_position="last")
-        else:
-            out_df = out_df.sort_values("mean_binding_score", ascending=False, na_position="last")
+        # Ascending: biggest drops (hotspots) surface first, matching alanine-scan convention.
+        out_df = out_df.sort_values("binding_score_delta", ascending=True, na_position="last")
     out_csv = out_root / "mutation_candidates.csv"
     out_df.to_csv(out_csv, index=False)
 
     print(f"\n{'='*70}")
     print(f"Done. {len(results)} mutant(s) scored.")
-    print(f"Reference: bsa_A2={ref_metrics['bsa_A2']}  n_clashes={ref_metrics['n_clashes']}")
+    print(f"WT (rescored): mean_binding_score={wt_binding_score}  "
+          f"mean_iptm={wt_summary['mean_iptm']}  mean_bsa_A2={wt_summary['mean_bsa_A2']}")
+    print(f"Reference geometry (input --complex-cif): bsa_A2={ref_metrics['bsa_A2']}  "
+          f"n_clashes={ref_metrics['n_clashes']}")
     if not out_df.empty:
-        print(f"\nTop candidates by {'binding_score_delta' if have_delta else 'mean_binding_score'}:")
+        print("\nTop candidates by binding_score_delta:")
         cols = ["Round", "Variant", "CDR", "Position_label", "mean_binding_score",
                 "binding_score_delta", "mean_iptm", "total_clashes"]
         print(out_df[cols].head(10).to_string(index=False))
